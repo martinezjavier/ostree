@@ -86,15 +86,6 @@ symlink_at_replace (const char    *oldpath,
   return TRUE;
 }
 
-static GLnxFileCopyFlags
-sysroot_flags_to_copy_flags (GLnxFileCopyFlags defaults,
-                             OstreeSysrootDebugFlags sysrootflags)
-{
-  if (sysrootflags & OSTREE_SYSROOT_DEBUG_NO_XATTRS)
-    defaults |= GLNX_FILE_COPY_NOXATTRS;
-  return defaults;
-}
-
 /* Try a hardlink if we can, otherwise fall back to copying.  Used
  * right now for kernels/initramfs/device trees in /boot, where we can just
  * hardlink if we're on the same partition.
@@ -134,101 +125,6 @@ install_into_boot (OstreeSePolicy *sepolicy,
         }
       else
         return glnx_throw_errno_prefix (error, "linkat(%s)", dest_subpath);
-    }
-
-  return TRUE;
-}
-
-/* Copy ownership, mode, and xattrs from source directory to destination */
-static gboolean
-dirfd_copy_attributes_and_xattrs (int            src_parent_dfd,
-                                  const char    *src_name,
-                                  int            src_dfd,
-                                  int            dest_dfd,
-                                  OstreeSysrootDebugFlags flags,
-                                  GCancellable  *cancellable,
-                                  GError       **error)
-{
-  g_autoptr(GVariant) xattrs = NULL;
-
-  /* Clone all xattrs first, so we get the SELinux security context
-   * right.  This will allow other users access if they have ACLs, but
-   * oh well.
-   */
-  if (!(flags & OSTREE_SYSROOT_DEBUG_NO_XATTRS))
-    {
-      if (!glnx_dfd_name_get_all_xattrs (src_parent_dfd, src_name,
-                                         &xattrs, cancellable, error))
-        return FALSE;
-      if (!glnx_fd_set_all_xattrs (dest_dfd, xattrs,
-                                   cancellable, error))
-        return FALSE;
-    }
-
-  struct stat src_stbuf;
-  if (!glnx_fstat (src_dfd, &src_stbuf, error))
-    return FALSE;
-  if (fchown (dest_dfd, src_stbuf.st_uid, src_stbuf.st_gid) != 0)
-    return glnx_throw_errno_prefix (error, "fchown");
-  if (fchmod (dest_dfd, src_stbuf.st_mode) != 0)
-    return glnx_throw_errno_prefix (error, "fchmod");
-
-  return TRUE;
-}
-
-static gboolean
-copy_dir_recurse (int              src_parent_dfd,
-                  int              dest_parent_dfd,
-                  const char      *name,
-                  OstreeSysrootDebugFlags flags,
-                  GCancellable    *cancellable,
-                  GError         **error)
-{
-  g_auto(GLnxDirFdIterator) src_dfd_iter = { 0, };
-  glnx_autofd int dest_dfd = -1;
-  struct dirent *dent;
-
-  if (!glnx_dirfd_iterator_init_at (src_parent_dfd, name, TRUE, &src_dfd_iter, error))
-    return FALSE;
-
-  /* Create with mode 0700, we'll fchmod/fchown later */
-  if (!glnx_ensure_dir (dest_parent_dfd, name, 0700, error))
-    return FALSE;
-
-  if (!glnx_opendirat (dest_parent_dfd, name, TRUE, &dest_dfd, error))
-    return FALSE;
-
-  if (!dirfd_copy_attributes_and_xattrs (src_parent_dfd, name, src_dfd_iter.fd, dest_dfd,
-                                         flags, cancellable, error))
-    return FALSE;
-
-  while (TRUE)
-    {
-      struct stat child_stbuf;
-
-      if (!glnx_dirfd_iterator_next_dent (&src_dfd_iter, &dent, cancellable, error))
-        return FALSE;
-      if (dent == NULL)
-        break;
-
-      if (!glnx_fstatat (src_dfd_iter.fd, dent->d_name, &child_stbuf,
-                         AT_SYMLINK_NOFOLLOW, error))
-        return FALSE;
-
-      if (S_ISDIR (child_stbuf.st_mode))
-        {
-          if (!copy_dir_recurse (src_dfd_iter.fd, dest_dfd, dent->d_name,
-                                 flags, cancellable, error))
-            return FALSE;
-        }
-      else
-        {
-          if (!glnx_file_copy_at (src_dfd_iter.fd, dent->d_name, &child_stbuf,
-                                  dest_dfd, dent->d_name,
-                                  sysroot_flags_to_copy_flags (GLNX_FILE_COPY_OVERWRITE, flags),
-                                  cancellable, error))
-            return FALSE;
-        }
     }
 
   return TRUE;
@@ -290,8 +186,8 @@ ensure_directory_from_template (int                 orig_etc_fd,
   if (!glnx_opendirat (new_etc_fd, path, TRUE, &target_dfd, error))
     return FALSE;
 
-  if (!dirfd_copy_attributes_and_xattrs (modified_etc_fd, path, src_dfd, target_dfd,
-                                         flags, cancellable, error))
+  if (!ot_dirfd_copy_attributes_and_xattrs (modified_etc_fd, path, src_dfd, target_dfd,
+                                            flags, cancellable, error))
     return FALSE;
 
   if (out_dfd)
@@ -365,15 +261,15 @@ copy_modified_config_file (int                 orig_etc_fd,
 
   if (S_ISDIR (modified_stbuf.st_mode))
     {
-      if (!copy_dir_recurse (modified_etc_fd, new_etc_fd, path, flags,
-                             cancellable, error))
+      if (!ot_copy_dir_recurse (modified_etc_fd, new_etc_fd, path, flags,
+                                cancellable, error))
         return FALSE;
     }
   else if (S_ISLNK (modified_stbuf.st_mode) || S_ISREG (modified_stbuf.st_mode))
     {
       if (!glnx_file_copy_at (modified_etc_fd, path, &modified_stbuf,
                               new_etc_fd, path,
-                              sysroot_flags_to_copy_flags (GLNX_FILE_COPY_OVERWRITE, flags),
+                              ot_sysroot_flags_to_copy_flags (GLNX_FILE_COPY_OVERWRITE, flags),
                               cancellable, error))
         return FALSE;
     }
